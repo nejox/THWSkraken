@@ -51,8 +51,8 @@ class SoupChef:
     def __init__(self, driverConfig=None):
         if driverConfig is None:
             self.config = {
-                "max_try" : 3,
-                "timeout" : 60,
+                "MAX_RETRY" : 3,
+                "TIMEOUT" : 60,
                 "WEBDRIVER_DIR" : "./drivers",
                 "WEBDRIVER_FILE" : "chromedriver.exe"
             }
@@ -76,11 +76,11 @@ class SoupChef:
             driver_options.headless = True
 
             if os.name == 'posix':
-                path = os.path.join(config.WEBDRIVER_DIR, "linux", config.WEBDRIVER_FILE)
+                path = os.path.join(self.config["WEBDRIVER_DIR"], "linux", self.config["WEBDRIVER_FILE"])
                 ser = Service(path)
                 return webdriver.Chrome(service=ser, options=driver_options, service_log_path='/dev/null')
             else:
-                path = os.path.join(config.WEBDRIVER_DIR, "windows", config.WEBDRIVER_FILE)
+                path = os.path.join(self.config["WEBDRIVER_DIR"], "windows", self.config["WEBDRIVER_FILE"])
                 ser = Service(path)
                 return webdriver.Chrome(service=ser, options=driver_options, service_log_path='NUL')
 
@@ -111,12 +111,12 @@ class SoupChef:
         """
         page = None
         retry_count = 0
-        while page is None and retry_count < 4:
+        while page is None and retry_count < self.config["MAX_RETRY"]:
             try:
                 retry_count += 1
-                page = requests.get(URL, timeout=self.config.timeout)
+                page = requests.get(URL, timeout=self.config["TIMEOUT"])
             except Exception as e:
-                if retry_count == 3:  # TODO: make this a config option
+                if retry_count == self.config["MAX_RETRY"]-1:  # TODO: make this a config option
                     logging.error("request unable to get: " + URL)
                     return None
 
@@ -136,7 +136,7 @@ class SoupChef:
         """
         page = None
         retry_count = 0
-        while page is None and retry_count < 4:
+        while page is None and retry_count < self.config["MAX_RETRY"]:
             try:
                 retry_count += 1
                 self.driver.get(URL)
@@ -144,7 +144,7 @@ class SoupChef:
                 page = self.driver.page_source
 
             except Exception as e:
-                if retry_count == 3:  # TODO: make this a config option
+                if retry_count == self.config["MAX_RETRY"]-1: 
                     logging.error("chromeDriver unable to get: " + URL)
                     return None
 
