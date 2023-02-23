@@ -46,46 +46,61 @@ class Config:
             self.timeout = cf_json.get("timeout", self.timeout)
 
 
-class Kraken:
+class SoupChef:
 
-    def __init__(self, config):
-        self.config = config
-        self.queue = Queue()
-        self.queue.put(self.config.baseURL)
-        self.visited = set()
-        self.files = []
-        self.pool = ThreadPoolExecutor(max_workers=self.config.threadCount)
-        self.driver = self._get_webdriver()
-
-    def run(self):
-        # 1st step: find all courses and save all data urls to files[]
-        while True:
-            try:
-                target = self.queue.get(block=True, timeout=4)
-                self.visited.add(target)
-                # self.pool.submit(self.scrape, target)
-                self.scrape(target)
-                self.driver.quit()
-            except Empty:
-                break
-            except Exception as e:
-                print(e)
-
-        # 2nd step: download all files in files[] to directory
-        print("visited: ")
-        print(self.visited)
-        print("------------------")
-        print("files: ")
-        print(self.files)
-
-    def scrape(self, url):
-
-        if self._is_relative_URL(url):
-            source_URL = self.config.baseURL + url
+    def __init__(self, driverConfig=None):
+        if driverConfig is None:
+            self.config = {
+                "max_try" : 3,
+                "timeout" : 60,
+                "WEBDRIVER_DIR" : "./drivers",
+                "WEBDRIVER_FILE" : "chromedriver.exe"
+            }
         else:
-            source_URL = url
+            self.config = driverConfig
+        self.driver = self._get_webdriver()
+        self.soup = None
 
-        courses = self.parse_page(source_URL)
+    @staticmethod
+    def _get_webdriver():
+        """
+        returns a webdriver for selenium
+        expects you to have the file in a directory named after your os (linux / windows / if you use mac, go buy linux)
+        https://www.makeuseof.com/how-to-install-selenium-webdriver-on-any-computer-with-python/
+        """
+        path = None
+        try:
+            driver_options = Options()
+            # driver_options.add_experimental_option('excludeSwitches', ['enable-logging'])
+            # trying to block logging from webdriver as it spams the log unnecessarily
+            driver_options.headless = True
+
+            if os.name == 'posix':
+                path = os.path.join(config.WEBDRIVER_DIR, "linux", config.WEBDRIVER_FILE)
+                ser = Service(path)
+                return webdriver.Chrome(service=ser, options=driver_options, service_log_path='/dev/null')
+            else:
+                path = os.path.join(config.WEBDRIVER_DIR, "windows", config.WEBDRIVER_FILE)
+                ser = Service(path)
+                return webdriver.Chrome(service=ser, options=driver_options, service_log_path='NUL')
+
+        except Exception as e:
+            logging.error("failed to initialize webdriver for selenium, /"
+                          "make sure you downloaded a driver and wrote the correct path to config, /"
+                          "current path: " + path)
+            logging.error(e)
+
+    def get_soup_from_URL(self, URL, dynamic=False):
+        if dynamic:
+            if not self.driver:
+                self.driver = self._get_webdriver()
+            self.soup = self._get_soup_of_dynamic_page(URL)
+        else:
+            self.soup = self._get_soup_of_static_page(URL)
+        return self.soup
+
+    def get_soup_from_text(self, text):
+        return BeautifulSoup(text, 'html.parser')
 
     def _get_soup_of_static_page(self, URL):
         """
@@ -125,7 +140,7 @@ class Kraken:
             try:
                 retry_count += 1
                 self.driver.get(URL)
-                #time.sleep(1)  # load page
+                # time.sleep(1)  # load page
                 page = self.driver.page_source
 
             except Exception as e:
@@ -140,6 +155,48 @@ class Kraken:
 
         return soup
 
+
+class Kraken:
+
+    def __init__(self, scraping_config):
+        self.config = scraping_config
+        self.queue = Queue()
+        self.queue.put(self.config.baseURL)
+        self.visited = set()
+        self.files = []
+        self.pool = ThreadPoolExecutor(max_workers=self.config.threadCount)
+        self.soupChef = SoupChef(self.config)
+
+    def run(self):
+        # 1st step: find all courses and save all data urls to files[]
+        while True:
+            try:
+                target = self.queue.get(block=True, timeout=4)
+                self.visited.add(target)
+                # self.pool.submit(self.scrape, target)
+                self.scrape(target)
+
+            except Empty:
+                break
+            except Exception as e:
+                print(e)
+
+        # 2nd step: download all files in files[] to directory
+        print("visited: ")
+        print(self.visited)
+        print("------------------")
+        print("files: ")
+        print(self.files)
+
+    def scrape(self, url):
+
+        if self._is_relative_URL(url):
+            source_URL = self.config.baseURL + url
+        else:
+            source_URL = url
+
+        courses = self.parse_page(source_URL)
+
     @staticmethod
     def _is_relative_URL(URL):
         """
@@ -152,7 +209,7 @@ class Kraken:
 
     def parse_page(self, source_URL):
 
-        soup = self._get_soup_of_dynamic_page(source_URL)
+        soup = self.soupChef.get_soup_from_URL(source_URL)
         if soup is None:
             return
 
@@ -194,34 +251,6 @@ class Kraken:
                 filteredElements.append(element)
 
         return filteredElements
-
-    def _get_webdriver(self):
-        """
-        returns a webdriver for selenium
-        expects you to have the file in a directory named after your os (linux / windows / if you use mac, go buy linux)
-        https://www.makeuseof.com/how-to-install-selenium-webdriver-on-any-computer-with-python/
-        """
-        path = None
-        try:
-            driver_options = Options()
-            # driver_options.add_experimental_option('excludeSwitches', ['enable-logging'])
-            # trying to block logging from webdriver as it spams the log unnecessarily
-            driver_options.headless = True
-
-            if os.name == 'posix':
-                path = os.path.join(config.WEBDRIVER_DIR, "linux", config.WEBDRIVER_FILE)
-                ser = Service(path)
-                return webdriver.Chrome(service=ser, options=driver_options, service_log_path='/dev/null')
-            else:
-                path = os.path.join(config.WEBDRIVER_DIR, "windows", config.WEBDRIVER_FILE)
-                ser = Service(path)
-                return webdriver.Chrome(service=ser, options=driver_options, service_log_path='NUL')
-
-        except Exception as e:
-            logging.error("failed to initialize webdriver for selenium, /"
-                          "make sure you downloaded a driver and wrote the correct path to config, /"
-                          "current path: " + path)
-            logging.error(e)
 
 
 if __name__ == '__main__':
