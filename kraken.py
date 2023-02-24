@@ -2,34 +2,64 @@ import json
 import logging
 import os
 import re
-import time
+import sys
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
+import time
 from queue import Queue, Empty
 
 import requests
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 
+logging.basicConfig(level=logging.INFO, handlers=[
+    logging.FileHandler("kraken.log"),
+    logging.StreamHandler(sys.stdout)
+])
+
+
+def slugify(value, allow_unicode=True):
+    """
+    Taken from https://github.com/django/django/blob/master/django/utils/text.py
+    Convert to ASCII if 'allow_unicode' is False. Convert spaces or repeated
+    dashes to single dashes. Remove characters that aren't alphanumerics,
+    underscores, or hyphens. Convert to lowercase. Also strip leading and
+    trailing whitespace, dashes, and underscores.
+    """
+    value = str(value)
+    value.replace("ä", "ae").replace("Ä", "Ae").replace("ö", "oe").replace("Ö", "Oe").replace("ü", "ue").replace("Ü",
+                                                                                                                 "Ue").replace(
+        "ß", "ss")
+    if allow_unicode:
+        value = unicodedata.normalize('NFKC', value)
+    else:
+        value = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore').decode('ascii')
+    value = re.sub(r'[^\w\s-]', '', value.lower())
+    return re.sub(r'[-\s]+', '_', value).strip('-_')
+
 
 class Config:
     def __init__(self, config_file=""):
-        self.baseURL = "https://elearning.fhws.de/course/index.php?mycourses=1"
-        self.element_selector = "h4 a"
-        self.filter_courses = [
+        self.BASE_URL = "https://elearning.fhws.de/course/index.php?mycourses=1"
+        self.element_selector = ""
+        self.FILTER_COURSES = [
             {
-                "condition_string": "//p/",
+                "condition_string": "Gründen@FHWS",
                 "include_condition": False
             }
         ]
-        self.filter_filetypes = []
-        self.threadCount = 12
-        self.timeout = 60
-        self.save_directory = "C:/Users/Jochen/Desktop/testScraper/"
+        self.FILTER_FILETYPES = []  # ["mat", "csv",...]
+        self.THREAD_COUNT = 12
+        self.TIMEOUT = 60
+        self.DOWNLOAD_PATH = "C:/Users/Jochen/Desktop/testScraper/"
 
         self.WEBDRIVER_DIR = "./drivers"
         self.WEBDRIVER_FILE = "chromedriver.exe"
+        self.CREDENTIALS = "credentials.env"
+        self.URLLIB_POOLSIZE = 15
 
         if config_file != "":
             self.read_config(config_file)
@@ -37,13 +67,16 @@ class Config:
     def read_config(self, config_file):
         with open(config_file, 'r') as f:
             cf_json = json.load(f)
-            self.baseURL = cf_json.get("baseURL", self.baseURL)
+            self.BASE_URL = cf_json.get("baseURL", self.BASE_URL)
             self.element_selector = cf_json.get("element_selector", self.element_selector)
-            self.filter_courses = cf_json.get("filter_courses", self.filter_courses)
-            self.save_directory = cf_json.get("saveDirectory", self.save_directory)
+            self.FILTER_COURSES = cf_json.get("filter_courses", self.FILTER_COURSES)
+            self.DOWNLOAD_PATH = cf_json.get("saveDirectory", self.DOWNLOAD_PATH)
 
-            self.threadCount = cf_json.get("threadCount", self.threadCount)
-            self.timeout = cf_json.get("timeout", self.timeout)
+            self.THREAD_COUNT = cf_json.get("threadCount", self.THREAD_COUNT)
+            self.TIMEOUT = cf_json.get("timeout", self.TIMEOUT)
+            self.WEBDRIVER_DIR = cf_json.get("webdriver_dir", self.WEBDRIVER_DIR)
+            self.WEBDRIVER_FILE = cf_json.get("webdriver_file", self.WEBDRIVER_FILE)
+            self.CREDENTIALS = cf_json.get("credentials", self.CREDENTIALS)
 
 
 class SoupChef:
@@ -51,18 +84,19 @@ class SoupChef:
     def __init__(self, driverConfig=None):
         if driverConfig is None:
             self.config = {
-                "MAX_RETRY" : 3,
-                "TIMEOUT" : 60,
-                "WEBDRIVER_DIR" : "./drivers",
-                "WEBDRIVER_FILE" : "chromedriver.exe"
+                "MAX_RETRY": 3,
+                "TIMEOUT": 60,
+                "WEBDRIVER_DIR": "./drivers",
+                "WEBDRIVER_FILE": "chromedriver.exe"
             }
         else:
             self.config = driverConfig
-        self.driver = self._get_webdriver()
-        self.soup = None
 
-    @staticmethod
-    def _get_webdriver():
+        self.driver = None
+        self.soup = None
+        self.Parser = 'html.parser'
+
+    def _get_webdriver(self):
         """
         returns a webdriver for selenium
         expects you to have the file in a directory named after your os (linux / windows / if you use mac, go buy linux)
@@ -90,19 +124,20 @@ class SoupChef:
                           "current path: " + path)
             logging.error(e)
 
-    def get_soup_from_URL(self, URL, dynamic=False):
+    def get_soup_from_URL(self, URL, session=None, dynamic=False):
         if dynamic:
             if not self.driver:
                 self.driver = self._get_webdriver()
-            self.soup = self._get_soup_of_dynamic_page(URL)
+            self.soup = self._get_soup_of_dynamic_page(URL, session=session)
         else:
-            self.soup = self._get_soup_of_static_page(URL)
+            self.soup = self._get_soup_of_static_page(URL, session=session)
         return self.soup
 
     def get_soup_from_text(self, text):
-        return BeautifulSoup(text, 'html.parser')
+        self.soup = BeautifulSoup(text, self.Parser)
+        return self.soup
 
-    def _get_soup_of_static_page(self, URL):
+    def _get_soup_of_static_page(self, URL, session=None):
         """
         parses the given URL and returns the soup
         object of a static loaded page
@@ -114,26 +149,33 @@ class SoupChef:
         while page is None and retry_count < self.config["MAX_RETRY"]:
             try:
                 retry_count += 1
-                page = requests.get(URL, timeout=self.config["TIMEOUT"])
+                if session is None:
+                    page = requests.get(URL, timeout=self.config["TIMEOUT"])
+                else:
+                    page = session.get(URL, timeout=self.config["TIMEOUT"])
             except Exception as e:
-                if retry_count == self.config["MAX_RETRY"]-1:  # TODO: make this a config option
+                if retry_count == self.config["MAX_RETRY"] - 1:  # TODO: make this a config option
                     logging.error("request unable to get: " + URL)
                     return None
 
-        soup = BeautifulSoup(page.content, 'html.parser')
+        soup = BeautifulSoup(page.content, self.Parser)
 
         if soup is None:
             logging.error("No soup could be cooked for" + URL + " !")
 
         return soup
 
-    def _get_soup_of_dynamic_page(self, URL):
+    def _get_soup_of_dynamic_page(self, URL, session=None):
         """
         parses the given URL and returns the soup
         object of a dynamic loaded page
         :param URL: the URL to parse
         :return: the soup object
         """
+        if session is not None:
+            for cookie in session.cookies:
+                self.driver.add_cookie({'name': cookie.name, 'value': cookie.value})
+
         page = None
         retry_count = 0
         while page is None and retry_count < self.config["MAX_RETRY"]:
@@ -144,58 +186,145 @@ class SoupChef:
                 page = self.driver.page_source
 
             except Exception as e:
-                if retry_count == self.config["MAX_RETRY"]-1: 
+                if retry_count == self.config["MAX_RETRY"] - 1:
                     logging.error("chromeDriver unable to get: " + URL)
                     return None
 
-        soup = BeautifulSoup(page, 'html.parser')
+        soup = BeautifulSoup(page, self.Parser)
 
         if soup is None:
             logging.error("No soup could be cooked for" + URL + " !")
 
         return soup
 
+    def shutdown(self):
+        if self.driver:
+            logging.info("shutting down webdriver")
+            self.driver.quit()
+
 
 class Kraken:
 
     def __init__(self, scraping_config):
         self.config = scraping_config
-        self.queue = Queue()
-        self.queue.put(self.config.baseURL)
+        self.to_visit = Queue()
+        self.to_visit.put({"url": self.config.BASE_URL, "type": "base"})
         self.visited = set()
-        self.files = []
-        self.pool = ThreadPoolExecutor(max_workers=self.config.threadCount)
-        self.soupChef = SoupChef(self.config)
+        self.files = Queue()
+        self.pool = ThreadPoolExecutor(max_workers=self.config.THREAD_COUNT)
+        self.session = None
+        self.soupChef = SoupChef({"MAX_RETRY": 4, "TIMEOUT": 60, "WEBDRIVER_DIR": scraping_config.WEBDRIVER_DIR,
+                                  "WEBDRIVER_FILE": scraping_config.WEBDRIVER_FILE})
+        self.ajaxCalls = (
+            'https://elearning.fhws.de/theme/remui/request_handler.php?action=get_courses_ajax&wdmdata={'
+            '"category":"all","sort":null,"search":"","tab":true,"page":{"courses":0,"mycourses":',
+            '},"pagination":true,"view":null,"isFilterModified":true}')
 
     def run(self):
-        # 1st step: find all courses and save all data urls to files[]
+        # first login to get the session cookies and then start the scraping with a session for every thread with
+        # saved cookies
+        self._init_session()
+        self._do_login()
+        # self._init_soupChef()
         while True:
             try:
-                target = self.queue.get(block=True, timeout=4)
-                self.visited.add(target)
-                # self.pool.submit(self.scrape, target)
-                self.scrape(target)
+                target = self.to_visit.get(block=True, timeout=15)  # first time takes some while..
+                self.visited.add(target["url"])
+                self.pool.submit(self.scrape, target)
 
             except Empty:
+                self._shutdown()
                 break
             except Exception as e:
                 print(e)
+                logging.error(e)
+                break
 
-        # 2nd step: download all files in files[] to directory
-        print("visited: ")
-        print(self.visited)
-        print("------------------")
-        print("files: ")
-        print(self.files)
+        logging.info("finished scraping")
+        print("visited: ", len(self.visited))
 
-    def scrape(self, url):
+    def scrape(self, target):
+        url = target["url"]
 
         if self._is_relative_URL(url):
-            source_URL = self.config.baseURL + url
+            source_URL = self.config.BASE_URL + url
         else:
             source_URL = url
 
-        courses = self.parse_page(source_URL)
+        if target["type"] == "base":
+            courses = self._filter(self._get_courses())
+            for course in courses:
+                if course not in self.visited:
+                    self.to_visit.put({"url": course, "type": "course"})
+
+        elif target["type"] == "course":
+            self.parse_coursepage(source_URL)
+
+        else:
+            file_name, file_url = self.parse_filepage(source_URL)
+            self.save_file({"file_name": file_name, "file_url": file_url, "folder_name": target["block"],
+                            "course_name": target["course"]})
+
+    def _do_login(self):
+        try:
+            load_dotenv(config.CREDENTIALS)
+        except Exception as e:
+            logging.error("could not load credentials-file")
+            return
+        logging.info("successfully loaded credentials-file")
+
+        login_url, token = self._get_form_data(self.config.BASE_URL)  # 'https://elearning.fhws.de/login/index.php'
+        login_data = {
+            'username': os.environ.get('STUDENT_USER'),
+            'password': os.environ.get('STUDENT_PASSWORD'),
+            'logintoken': token
+        }
+        response = self.session.post(login_url, data=login_data)
+        if response.status_code != 200:
+            logging.error("login failed")
+            return
+        logging.info("login successful")
+
+    def _get_courses(self):
+        index = 0
+        courses = []
+
+        response = self.session.get(self.ajaxCalls[0] + str(index) + self.ajaxCalls[1])
+        if response.status_code == 200:
+            logging.info(f"ajax call (nr: {index}) successful")
+        else:
+            logging.error(f"ajax call (nr: {index}) failed")
+
+        content = response.json()
+        courses.extend(content["courses"])
+        index += 1
+
+        if "pagination" in content:
+            maxIndex = max(map(int, re.findall("page=(\d)", content["pagination"])))
+        else:
+            maxIndex = 0
+
+        while index <= maxIndex:
+            response = self.session.get(self.ajaxCalls[0] + str(index) + self.ajaxCalls[1])
+            if response.status_code == 200:
+                logging.info(f"ajax call (nr: {index}) successful")
+
+                content = response.json()
+                courses.extend(content["courses"])
+                index += 1
+
+            else:
+                logging.error(f"ajax call (nr: {index}) failed")
+
+        logging.info(f"found {len(courses)} courses")
+        return courses
+
+    def _get_form_data(self, url):
+        response = self.session.get(url)
+        soup = self.soupChef.get_soup_from_text(response.text)
+        login_url = soup.find('form', {'id': 'login'})['action']
+        token = soup.find('input', {'name': 'logintoken'})['value']
+        return login_url, token
 
     @staticmethod
     def _is_relative_URL(URL):
@@ -207,39 +336,75 @@ class Kraken:
         """
         return not bool(re.search("^http", URL))
 
-    def parse_page(self, source_URL):
+    def parse_coursepage(self, source_URL):
 
-        soup = self.soupChef.get_soup_from_URL(source_URL)
+        soup = self.soupChef.get_soup_from_URL(source_URL, self.session)
         if soup is None:
             return
 
-        # find all links in the page
-        elements = self._filter(soup.find_all(self.config.element_selector))
+        # find all blocks on the page
+        blocks = soup.select(".card.section")
+        course_name = soup.select_one("h1").text.strip()
+        # iterate over all blocks
+        for block in blocks:
+            # find name of the block (e.g. "Lernmaterialien")
+            block_name = block.select("h4 > a")[0].text.strip()
+            # for each block, find all links
+            links = block.select("a[onclick]")
+            names = block.select("a[onclick] > span")
+            # iterate over all links
+            for idx, elem in enumerate(links):
+                name = names[idx].contents[0].strip()
+                link = elem["href"]
+                # TODO filter redirects
+                if "url" in link:
+                    continue
+                if link not in self.visited:
+                    self.to_visit.put(
+                        {"type": "file", "url": link, "name": name, "block": block_name, "course": course_name})
+            logging.info(f"found {len(links)} links in block {block_name} of course {course_name}")
 
-        # iterate over all links and check if they are a course
-        for element in elements:
-            if element.has_attr('href'):
-                href = element['href']
-            else:
-                href = element.find("a")['href']
+    def parse_filepage(self, source_URL):
 
-            if self._is_relative_URL(href):
-                href = self.config.baseURL + href
+        soup = self.soupChef.get_soup_from_URL(source_URL, self.session)
+        if soup is None:
+            return
 
-            if self._is_course(href):
-                self.queue.put(href)
-            elif self._is_file(href):
-                self.files.append(href)
+        is_folder = bool(re.search("folder", source_URL))
+
+        if is_folder:
+            # file name
+            fileName = soup.select_one("h2").text.strip()
+            # find form data
+            form_tag = soup.select_one("form:not([id])[method=post]")
+            method = form_tag["method"]
+            action = form_tag["action"]
+            value = soup.select_one("input[name=id]")["value"]
+            fileURL = action + "?id=" + value
+
+        else:
+            # find data link
+            tag = soup.select_one(".resourceworkaround a[onclick]")
+            fileName = tag.text
+            fileURL = tag["href"]
+            # TODO filter by filetype?
+
+        logging.info(f"found file {fileName} at {fileURL}")
+        return fileName, fileURL
 
     def _filter(self, elements):
 
         filteredElements = []
         for element in elements:
-            link = element.find("a")
-            name = element.find("div.text_to_html").text
+            if isinstance(element, dict):
+                name = re.search(">(.*)<", element["coursename"]).group(1)
+                element = element["courseurl"]
+            else:
+                link = element.find("a")
+                name = element.find("div.text_to_html").text
 
             valid = True
-            for condition in self.config.filter_courses:
+            for condition in self.config.FILTER_COURSES:
                 is_included = bool(re.search(condition["condition_string"], name))
 
                 if condition["include_condition"]:
@@ -250,7 +415,41 @@ class Kraken:
             if valid:
                 filteredElements.append(element)
 
+        logging.info(f"filtered {len(elements) - len(filteredElements)} elements")
         return filteredElements
+
+    def _init_session(self):
+        self.session = requests.Session()
+        if self.config.URLLIB_POOLSIZE:
+            logging.info(f"setting maxsize of urllib pool to {self.config.URLLIB_POOLSIZE}")
+            self.session.get_adapter(self.config.BASE_URL).poolmanager.connection_pool_kw[
+                "maxsize"] = self.config.URLLIB_POOLSIZE
+
+    def save_file(self, param):
+        file_name = param["file_name"].replace(" ", "_")
+        file_url = param["file_url"]
+        block_name = slugify(param["folder_name"])
+        course_name = slugify(param["course_name"])
+
+        try:
+            file_path = os.path.join(self.config.DOWNLOAD_PATH, course_name, block_name)
+            file_bytes = self.session.get(file_url).content
+            file_type = os.path.splitext(file_name)[-1]
+            if file_type == "":
+                file_name += ".zip"
+            full_path = os.path.join(file_path, file_name)
+            os.makedirs(file_path, exist_ok=True)
+            with open(full_path, "wb") as f:
+                f.write(file_bytes)
+        except Exception as e:
+            logging.error(f"error while saving file {file_name} from {file_url}: {e}")
+        logging.info(f"saved file {file_name} of {course_name}")
+
+
+    def _shutdown(self):
+        logging.info("shutting down pool and soupChef")
+        self.pool.shutdown(wait=True)
+        self.soupChef.shutdown()
 
 
 if __name__ == '__main__':
