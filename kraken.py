@@ -191,7 +191,7 @@ class SoupChef:
                     return None
 
         if page.status_code == 303:
-            logging.error("request got redirected: " + URL + " to " + page.url)
+            logging.info("request got redirected: " + URL + " to " + page.url)
             # this means the file is a forced download, so we can't scrape the page
             raise RedirectException(page.headers["Location"])
 
@@ -397,7 +397,9 @@ class Kraken:
                 link = elem["href"]
                 # TODO filter redirects
                 # TODO make constants
-                if "url" in link or "questionnaire" in link:
+                # TODO beautify
+                if "url" in link or "questionnaire" in link or "forum" in link or "groupselect" in link \
+                        or "assign" in link or "page" in link or "workshop" in link or "data" in link:
                     continue
                 if link not in self.visited:
                     self.to_visit.put(
@@ -416,7 +418,7 @@ class Kraken:
 
             if is_folder:
                 # file name
-                fileName = soup.select_one("h2").text.strip()
+                fileName = soup.select_one("h2").text.strip().replace("/", "_")
                 # find form data
                 form_tag = soup.select_one("form:not([id])[method=post]")
                 method = form_tag["method"]
@@ -427,8 +429,19 @@ class Kraken:
             else:
                 # find data link
                 tag = soup.select_one(".resourceworkaround a[onclick]")
-                fileName = tag.text
-                fileURL = tag["href"]
+                if tag is None:
+                    # TODO beautify
+                    # may be a embedded pdf file like in "https://elearning.fhws.de/mod/resource/view.php?id=681498"
+                    # could also be embedded image like in https://elearning.fhws.de/mod/resource/view.php?id=686598
+                    tag = soup.select_one("object a")
+                if tag is None:
+                    tag = soup.select_one("img.resourceimage")
+                    fileURL = tag["src"]
+                    fileName = soup.select_one("h2").text.strip()
+                else:
+                    fileURL = tag["href"]
+                    fileName = tag.text
+
 
         except RedirectException as e:
             # some resource urls automatically redirect to the file
@@ -509,3 +522,8 @@ if __name__ == '__main__':
     config = Config()
     kraken = Kraken(config)
     kraken.run()
+
+
+# TODO: - stop filtering /url/ links (see blockchain course as they link videos as this)
+#       - more or less filter by looking at further link and stay in the domain
+#       - see parallele und verteilte systeme -> scorm videos aber abfuck
