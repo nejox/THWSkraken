@@ -7,7 +7,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 import time
 from queue import Queue, Empty
-
+from urllib.parse import urlparse, unquote
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -15,10 +15,15 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 
-logging.basicConfig(level=logging.INFO, handlers=[
-    logging.FileHandler("kraken.log"),
-    logging.StreamHandler(sys.stdout)
-])
+STANDARD_LOG_FORMAT = "[%(levelname)s][%(asctime)s]: %(message)s"
+STANDARD_LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+logging.basicConfig(level=logging.INFO,
+                    format=STANDARD_LOG_FORMAT, datefmt=STANDARD_LOG_DATE_FORMAT,
+                    handlers=[logging.FileHandler("kraken.log"),
+                              logging.StreamHandler(sys.stdout)
+                              ]
+                    )
 
 
 def slugify(value, allow_unicode=True):
@@ -49,12 +54,32 @@ class Config:
             {
                 "condition_string": "Gründen@FHWS",
                 "include_condition": False
+            },
+            {
+                "condition_string": "Robotics",
+                "include_condition": False
+            },
+            {
+               "condition_string": "Counselling",
+               "include_condition": False
+            },
+            {
+                "condition_string": "CampusPortal",
+                "include_condition": False
+            },
+            {
+                "condition_string": "General information for the Master Artificial Intelligence",
+                "include_condition": False
+            },
+            {
+                "condition_string": "FIW Internationales",
+                "include_condition": False
             }
         ]
         self.FILTER_FILETYPES = []  # ["mat", "csv",...]
         self.THREAD_COUNT = 12
         self.TIMEOUT = 60
-        self.DOWNLOAD_PATH = "C:/Users/Jochen/Desktop/testScraper/"
+        self.DOWNLOAD_PATH = "./scraper_test/"
 
         self.WEBDRIVER_DIR = "./drivers"
         self.WEBDRIVER_FILE = "chromedriver.exe"
@@ -77,6 +102,12 @@ class Config:
             self.WEBDRIVER_DIR = cf_json.get("webdriver_dir", self.WEBDRIVER_DIR)
             self.WEBDRIVER_FILE = cf_json.get("webdriver_file", self.WEBDRIVER_FILE)
             self.CREDENTIALS = cf_json.get("credentials", self.CREDENTIALS)
+
+
+class RedirectException(Exception):
+    """Raised when the file url redirects to the download"""
+    def __init__(self, new_url):
+        self.new_url = new_url
 
 
 class SoupChef:
@@ -150,13 +181,19 @@ class SoupChef:
             try:
                 retry_count += 1
                 if session is None:
-                    page = requests.get(URL, timeout=self.config["TIMEOUT"])
+                    page = requests.get(URL, timeout=self.config["TIMEOUT"], allow_redirects=False)
                 else:
-                    page = session.get(URL, timeout=self.config["TIMEOUT"])
+                    page = session.get(URL, timeout=self.config["TIMEOUT"], allow_redirects=False)
+
             except Exception as e:
                 if retry_count == self.config["MAX_RETRY"] - 1:  # TODO: make this a config option
                     logging.error("request unable to get: " + URL)
                     return None
+
+        if page.status_code == 303:
+            logging.error("request got redirected: " + URL + " to " + page.url)
+            # this means the file is a forced download, so we can't scrape the page
+            raise RedirectException(page.headers["Location"])
 
         soup = BeautifulSoup(page.content, self.Parser)
 
@@ -231,6 +268,7 @@ class Kraken:
                 target = self.to_visit.get(block=True, timeout=15)  # first time takes some while..
                 self.visited.add(target["url"])
                 self.pool.submit(self.scrape, target)
+                #self.scrape(target)
 
             except Empty:
                 self._shutdown()
@@ -262,8 +300,9 @@ class Kraken:
 
         else:
             file_name, file_url = self.parse_filepage(source_URL)
-            self.save_file({"file_name": file_name, "file_url": file_url, "folder_name": target["block"],
-                            "course_name": target["course"]})
+            if file_name is not None and file_url is not None:
+                self.save_file({"file_name": file_name, "file_url": file_url, "folder_name": target["block"],
+                                "course_name": target["course"]})
 
     def _do_login(self):
         try:
@@ -357,7 +396,8 @@ class Kraken:
                 name = names[idx].contents[0].strip()
                 link = elem["href"]
                 # TODO filter redirects
-                if "url" in link:
+                # TODO make constants
+                if "url" in link or "questionnaire" in link:
                     continue
                 if link not in self.visited:
                     self.to_visit.put(
@@ -365,31 +405,43 @@ class Kraken:
             logging.info(f"found {len(links)} links in block {block_name} of course {course_name}")
 
     def parse_filepage(self, source_URL):
+        fileName, fileURL = None, None
+        try:
 
-        soup = self.soupChef.get_soup_from_URL(source_URL, self.session)
-        if soup is None:
-            return
+            soup = self.soupChef.get_soup_from_URL(source_URL, self.session)
+            if soup is None:
+                return fileName, fileURL
 
-        is_folder = bool(re.search("folder", source_URL))
+            is_folder = bool(re.search("folder", source_URL))
 
-        if is_folder:
-            # file name
-            fileName = soup.select_one("h2").text.strip()
-            # find form data
-            form_tag = soup.select_one("form:not([id])[method=post]")
-            method = form_tag["method"]
-            action = form_tag["action"]
-            value = soup.select_one("input[name=id]")["value"]
-            fileURL = action + "?id=" + value
+            if is_folder:
+                # file name
+                fileName = soup.select_one("h2").text.strip()
+                # find form data
+                form_tag = soup.select_one("form:not([id])[method=post]")
+                method = form_tag["method"]
+                action = form_tag["action"]
+                value = soup.select_one("input[name=id]")["value"]
+                fileURL = action + "?id=" + value
 
-        else:
-            # find data link
-            tag = soup.select_one(".resourceworkaround a[onclick]")
-            fileName = tag.text
-            fileURL = tag["href"]
-            # TODO filter by filetype?
+            else:
+                # find data link
+                tag = soup.select_one(".resourceworkaround a[onclick]")
+                fileName = tag.text
+                fileURL = tag["href"]
+
+        except RedirectException as e:
+            # some resource urls automatically redirect to the file
+            fileURL = e.new_url
+            fileName = unquote(urlparse(e.new_url).path.split("/")[-1])
+            return fileName, fileURL
+
+        except Exception as e:
+            logging.error(f"failed to parse filepage {source_URL}")
+            return fileName, fileURL
 
         logging.info(f"found file {fileName} at {fileURL}")
+        # TODO filter by filetype
         return fileName, fileURL
 
     def _filter(self, elements):
@@ -436,6 +488,7 @@ class Kraken:
             file_bytes = self.session.get(file_url).content
             file_type = os.path.splitext(file_name)[-1]
             if file_type == "":
+                # TODO set default as a constant
                 file_name += ".zip"
             full_path = os.path.join(file_path, file_name)
             os.makedirs(file_path, exist_ok=True)
