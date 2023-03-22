@@ -74,7 +74,12 @@ class Config:
             {
                 "condition_string": "FIW Internationales",
                 "include_condition": False
+            },
+            {
+                "condition_string": "Cloud",
+                "include_condition": True
             }
+
         ]
         self.FILTER_FILETYPES = []  # ["mat", "csv",...]
         self.THREAD_COUNT = 12
@@ -267,8 +272,8 @@ class Kraken:
             try:
                 target = self.to_visit.get(block=True, timeout=15)  # first time takes some while..
                 self.visited.add(target["url"])
-                self.pool.submit(self.scrape, target)
-                #self.scrape(target)
+                #self.pool.submit(self.scrape, target)
+                self.scrape(target)
 
             except Empty:
                 self._shutdown()
@@ -291,11 +296,13 @@ class Kraken:
 
         if target["type"] == "base":
             courses = self._filter(self._get_courses())
+            print(courses)
             for course in courses:
                 if course not in self.visited:
                     self.to_visit.put({"url": course, "type": "course"})
 
         elif target["type"] == "course":
+            print("course: ", target["url"])
             self.parse_coursepage(source_URL)
 
         else:
@@ -305,11 +312,11 @@ class Kraken:
                                 "course_name": target["course"]})
 
     def _do_login(self):
-        try:
-            load_dotenv(config.CREDENTIALS)
-        except Exception as e:
-            logging.error("could not load credentials-file")
-            return
+
+        flag = load_dotenv(config.CREDENTIALS)
+        if not flag:
+            raise Exception("Credentials file not found")
+
         logging.info("successfully loaded credentials-file")
 
         login_url, token = self._get_form_data(self.config.BASE_URL)  # 'https://elearning.fhws.de/login/index.php'
@@ -335,7 +342,12 @@ class Kraken:
             logging.error(f"ajax call (nr: {index}) failed")
 
         content = response.json()
-        courses.extend(content["courses"])
+        requested_courses = content["courses"]
+        if len(requested_courses) == 0:
+            logging.error("no courses received during ajax call")
+            return
+        logging.info(f"received {len(requested_courses)} courses")
+        courses.extend(requested_courses)
         index += 1
 
         if "pagination" in content:
@@ -348,8 +360,12 @@ class Kraken:
             if response.status_code == 200:
                 logging.info(f"ajax call (nr: {index}) successful")
 
-                content = response.json()
-                courses.extend(content["courses"])
+                requested_courses = content["courses"]
+                if len(requested_courses) == 0:
+                    logging.error("no courses received during ajax call (nr: {index})")
+                    return
+                logging.info(f"received {len(requested_courses)} courses")
+                courses.extend(requested_courses)
                 index += 1
 
             else:
