@@ -6,10 +6,11 @@ import sys
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 import time
+import pandas as pd
 from queue import Queue, Empty
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, urlsplit
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -60,8 +61,8 @@ class Config:
                 "include_condition": False
             },
             {
-               "condition_string": "Counselling",
-               "include_condition": False
+                "condition_string": "Counselling",
+                "include_condition": False
             },
             {
                 "condition_string": "CampusPortal",
@@ -76,16 +77,36 @@ class Config:
                 "include_condition": False
             },
             {
-                "condition_string": "Cloud",
-                "include_condition": True
-            }
+                "condition_string": "How-To Blended Learning",
+                "include_condition": False
+            },
+            {
+                "condition_string": "KÃ¶rpersprache",
+                "include_condition": False
+            },
+            {
+                "condition_string": "SS21 Kommunikation &amp; Verhandlungstechnik",
+                "include_condition": False
+            },
+            {
+                "condition_string": "Arbeits- und PrÃ¤sentationstechniken",
+                "include_condition": False
+            },
+            {
+                "condition_string": "Konfliktmanagement",
+                "include_condition": False
+            },
+            # {
+            #     "condition_string": "Introduction in Machine Learning",
+            #     "include_condition": True
+            # }
 
         ]
         self.FILTER_FILETYPES = []  # ["mat", "csv",...]
         self.THREAD_COUNT = 12
         self.TIMEOUT = 60
         self.DOWNLOAD_PATH = "./scraper_test/"
-
+        self.MAX_FILE_SIZE_IN_MB = 200
         self.WEBDRIVER_DIR = "./drivers"
         self.WEBDRIVER_FILE = "chromedriver.exe"
         self.CREDENTIALS = "credentials.env"
@@ -111,6 +132,7 @@ class Config:
 
 class RedirectException(Exception):
     """Raised when the file url redirects to the download"""
+
     def __init__(self, new_url):
         self.new_url = new_url
 
@@ -253,27 +275,29 @@ class Kraken:
         self.to_visit.put({"url": self.config.BASE_URL, "type": "base"})
         self.visited = set()
         self.files = Queue()
+        self.domain = urlsplit(self.config.BASE_URL).netloc
         self.pool = ThreadPoolExecutor(max_workers=self.config.THREAD_COUNT)
         self.session = None
         self.soupChef = SoupChef({"MAX_RETRY": 4, "TIMEOUT": 60, "WEBDRIVER_DIR": scraping_config.WEBDRIVER_DIR,
                                   "WEBDRIVER_FILE": scraping_config.WEBDRIVER_FILE})
         self.ajaxCalls = (
             'https://elearning.fhws.de/theme/remui/request_handler.php?action=get_courses_ajax&wdmdata={'
-            '"category":"all","sort":null,"search":"","tab":true,"page":{"courses":0,"mycourses":',
-            '},"pagination":true,"view":null,"isFilterModified":true}')
+            '%22category%22:%22all%22,%22sort%22:null,%22search%22:%22%22,%22tab%22:true,%22page%22:{%22courses%22:0,'
+            '%22mycourses%22:%22 ',
+            '%22},%22pagination%22:true,%22view%22:%22grid%22,%22isFilterModified%22:true}')
 
     def run(self):
         # first login to get the session cookies and then start the scraping with a session for every thread with
         # saved cookies
         self._init_session()
         self._do_login()
-        # self._init_soupChef()
+
         while True:
             try:
                 target = self.to_visit.get(block=True, timeout=15)  # first time takes some while..
                 self.visited.add(target["url"])
-                #self.pool.submit(self.scrape, target)
-                self.scrape(target)
+                self.pool.submit(self.scrape, target)
+                #self.scrape(target)
 
             except Empty:
                 self._shutdown()
@@ -294,22 +318,26 @@ class Kraken:
         else:
             source_URL = url
 
-        if target["type"] == "base":
-            courses = self._filter(self._get_courses())
-            print(courses)
-            for course in courses:
-                if course not in self.visited:
-                    self.to_visit.put({"url": course, "type": "course"})
+        try:
+            if target["type"] == "base":
+                courses = self._filter(self._get_courses())
+                for course in courses:
+                    if course not in self.visited:
+                        self.to_visit.put({"url": course, "type": "course"})
 
-        elif target["type"] == "course":
-            print("course: ", target["url"])
-            self.parse_coursepage(source_URL)
+            elif target["type"] == "course":
+                self.parse_coursepage(source_URL)
 
-        else:
-            file_name, file_url = self.parse_filepage(source_URL)
-            if file_name is not None and file_url is not None:
-                self.save_file({"file_name": file_name, "file_url": file_url, "folder_name": target["block"],
-                                "course_name": target["course"]})
+            else:
+                if target["name"] == "404":
+                    print("hi 404")
+                file_name, file_url = self.parse_filepage(source_URL)
+                if file_name is not None and file_url is not None:
+                    self.save_file({"file_name": file_name, "file_url": file_url, "folder_name": target["block"],
+                                    "course_name": target["course"]})
+        except Exception as e:
+            logging.error(e)
+            print(e)
 
     def _do_login(self):
 
@@ -337,7 +365,7 @@ class Kraken:
 
         response = self.session.get(self.ajaxCalls[0] + str(index) + self.ajaxCalls[1])
         if response.status_code == 200:
-            logging.info(f"ajax call (nr: {index}) successful")
+            logging.info(f"ajax call (nr: {index}) successful - received {len(response.json()['courses'])} courses")
         else:
             logging.error(f"ajax call (nr: {index}) failed")
 
@@ -346,7 +374,6 @@ class Kraken:
         if len(requested_courses) == 0:
             logging.error("no courses received during ajax call")
             return
-        logging.info(f"received {len(requested_courses)} courses")
         courses.extend(requested_courses)
         index += 1
 
@@ -358,13 +385,13 @@ class Kraken:
         while index <= maxIndex:
             response = self.session.get(self.ajaxCalls[0] + str(index) + self.ajaxCalls[1])
             if response.status_code == 200:
-                logging.info(f"ajax call (nr: {index}) successful")
+                logging.info(f"ajax call (nr: {index}) successful - received {len(response.json()['courses'])} courses")
 
-                requested_courses = content["courses"]
+                requested_courses = response.json()["courses"]
                 if len(requested_courses) == 0:
                     logging.error("no courses received during ajax call (nr: {index})")
                     return
-                logging.info(f"received {len(requested_courses)} courses")
+
                 courses.extend(requested_courses)
                 index += 1
 
@@ -398,33 +425,84 @@ class Kraken:
             return
 
         # find all blocks on the page
-        blocks = soup.select(".card.section")
+        blocks = soup.select("li.section")
+        if blocks is None:
+            logging.error(f"no blocks found on {source_URL}")
+            return
+
         course_name = soup.select_one("h1").text.strip()
+        flag = True
+
         # iterate over all blocks
         for block in blocks:
             # find name of the block (e.g. "Lernmaterialien")
-            block_name = block.select("h4 > a")[0].text.strip()
+            block_name = block.select_one("h4 > a")
+            if block_name is None:
+                block_name = block.select_one("h4 div")
+                if block_name is None:
+                    # logging.error(f"no block name found on {source_URL}")
+                    continue
+            block_name = block_name.text.strip()
             # for each block, find all links
-            links = block.select("a[onclick]")
-            names = block.select("a[onclick] > span")
+            #links = self._filter(block.select("a[href]"))
+            links = block.select("a:not([href^='#'])")
+            # names = block.select("a[onclick] > span")
+            names = []
+            for link in links:
+                try:
+                    if len(link.contents) == 1 and isinstance(link.contents[0], NavigableString):
+                        names.append(link.contents[0].strip())
+                    else:
+                        tag = link.select_one("span:not(.fp-icon)")
+                        if tag is not None:
+                            names.append(tag.contents[0].strip())
+                        else:
+                            names.append("404")
+                except Exception as e:
+                    logging.error(f"error while parsing block {block_name} of course {course_name}: {e}")
+
+            if len(links) == 0:
+                logging.warning(f"no links found in block {block_name} of course {course_name}")
+                continue
+
             # iterate over all links
             for idx, elem in enumerate(links):
-                name = names[idx].contents[0].strip()
+                try:
+                    name = names[idx]
+                except IndexError as e:
+                    name = "404"
+                    logging.error(
+                        f"no name found for link {elem['href']} in block {block_name} of course {course_name}")
                 link = elem["href"]
                 # TODO filter redirects
                 # TODO make constants
                 # TODO beautify
                 if "url" in link or "questionnaire" in link or "forum" in link or "groupselect" in link \
-                        or "assign" in link or "page" in link or "workshop" in link or "data" in link:
+                        or "assign" in link or "page" in link or "workshop" in link or "data" in link or "user" in link\
+                        or "quiz" in link or "feedback" in link or "choicegroup" in link or "choice" in link\
+                        or "evaluation" in link or "scorm" in link or "lesson" in link or "lightboxgallery" in link\
+                        or "glossary" in link or "chat" in link or "#" in link or "mailto" in link:
                     continue
+
                 if link not in self.visited:
                     self.to_visit.put(
                         {"type": "file", "url": link, "name": name, "block": block_name, "course": course_name})
+                    flag = False
+
             logging.info(f"found {len(links)} links in block {block_name} of course {course_name}")
+
+        if flag:
+            logging.warning(f"no new links found in course {course_name}")
 
     def parse_filepage(self, source_URL):
         fileName, fileURL = None, None
         try:
+            pathEnding = os.path.splitext(source_URL)[-1]
+            if pathEnding != "" and not pathEnding.startswith(".php"):
+                # is file url
+                fileName = os.path.basename(urlparse(source_URL).path)
+                fileURL = source_URL
+                return fileName, fileURL
 
             soup = self.soupChef.get_soup_from_URL(source_URL, self.session)
             if soup is None:
@@ -458,7 +536,6 @@ class Kraken:
                     fileURL = tag["href"]
                     fileName = tag.text
 
-
         except RedirectException as e:
             # some resource urls automatically redirect to the file
             fileURL = e.new_url
@@ -481,8 +558,7 @@ class Kraken:
                 name = re.search(">(.*)<", element["coursename"]).group(1)
                 element = element["courseurl"]
             else:
-                link = element.find("a")
-                name = element.find("div.text_to_html").text
+                name = element.text.strip()
 
             valid = True
             for condition in self.config.FILTER_COURSES:
@@ -502,23 +578,33 @@ class Kraken:
     def _init_session(self):
         self.session = requests.Session()
         if self.config.URLLIB_POOLSIZE:
-            logging.info(f"setting maxsize of urllib pool to {self.config.URLLIB_POOLSIZE}")
+            logging.info(f"setting maxsize of urllib pool to: {self.config.URLLIB_POOLSIZE}")
             self.session.get_adapter(self.config.BASE_URL).poolmanager.connection_pool_kw[
                 "maxsize"] = self.config.URLLIB_POOLSIZE
 
     def save_file(self, param):
         file_name = param["file_name"].replace(" ", "_")
+        file_name = file_name[0:-6].replace(".", "_") + file_name[-6:]
         file_url = param["file_url"]
         block_name = slugify(param["folder_name"])
         course_name = slugify(param["course_name"])
 
         try:
-            file_path = os.path.join(self.config.DOWNLOAD_PATH, course_name, block_name)
+            # first head to get size
+            # TODO do that only for certain file types
+            file_size = int(self.session.head(file_url).headers["Content-Length"])
+            if (file_size/1000**2) > self.config.MAX_FILE_SIZE_IN_MB:
+                logging.info(f"file {file_name} from {course_name} is too big: {file_size/1000**2} MB")
+                return
+            # get file bytes
             file_bytes = self.session.get(file_url).content
+
+            file_path = os.path.join(self.config.DOWNLOAD_PATH, course_name, block_name)
             file_type = os.path.splitext(file_name)[-1]
             if file_type == "":
                 # TODO set default as a constant
                 file_name += ".zip"
+                #file_type = ".zip"
             full_path = os.path.join(file_path, file_name)
             os.makedirs(file_path, exist_ok=True)
             with open(full_path, "wb") as f:
@@ -526,7 +612,6 @@ class Kraken:
         except Exception as e:
             logging.error(f"error while saving file {file_name} from {file_url}: {e}")
         logging.info(f"saved file {file_name} of {course_name}")
-
 
     def _shutdown(self):
         logging.info("shutting down pool and soupChef")
@@ -539,7 +624,9 @@ if __name__ == '__main__':
     kraken = Kraken(config)
     kraken.run()
 
-
 # TODO: - stop filtering /url/ links (see blockchain course as they link videos as this)
 #       - more or less filter by looking at further link and stay in the domain
 #       - see parallele und verteilte systeme -> scorm videos aber abfuck
+# PROBLEME:
+# - https://elearning.fhws.de/course/view.php?id=18347
+# - https://elearning.fhws.de/mod/url/view.php?id=541300
