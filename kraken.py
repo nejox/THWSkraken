@@ -5,10 +5,9 @@ import re
 import sys
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
-import time
-import pandas as pd
 from queue import Queue, Empty
 from urllib.parse import urlparse, unquote, urlsplit
+
 import requests
 from bs4 import BeautifulSoup, NavigableString
 from dotenv import load_dotenv
@@ -19,12 +18,15 @@ from selenium.webdriver.chrome.service import Service
 STANDARD_LOG_FORMAT = "[%(levelname)s][%(asctime)s]: %(message)s"
 STANDARD_LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-logging.basicConfig(level=logging.INFO,
+logging.basicConfig(level=logging.ERROR,
                     format=STANDARD_LOG_FORMAT, datefmt=STANDARD_LOG_DATE_FORMAT,
                     handlers=[logging.FileHandler("kraken.log"),
                               logging.StreamHandler(sys.stdout)
                               ]
                     )
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 def slugify(value, allow_unicode=True):
@@ -97,7 +99,7 @@ class Config:
                 "include_condition": False
             },
             # {
-            #     "condition_string": "Introduction in Machine Learning",
+            #     "condition_string": "Parallel Programming",
             #     "include_condition": True
             # }
 
@@ -177,10 +179,10 @@ class SoupChef:
                 return webdriver.Chrome(service=ser, options=driver_options, service_log_path='NUL')
 
         except Exception as e:
-            logging.error("failed to initialize webdriver for selenium, /"
-                          "make sure you downloaded a driver and wrote the correct path to config, /"
-                          "current path: " + path)
-            logging.error(e)
+            logger.error("failed to initialize webdriver for selenium, /"
+                         "make sure you downloaded a driver and wrote the correct path to config, /"
+                         "current path: " + path)
+            logger.error(e)
 
     def get_soup_from_URL(self, URL, session=None, dynamic=False):
         if dynamic:
@@ -214,18 +216,18 @@ class SoupChef:
 
             except Exception as e:
                 if retry_count == self.config["MAX_RETRY"] - 1:  # TODO: make this a config option
-                    logging.error("request unable to get: " + URL)
-                    return None
+                    logger.error("request unable to get: " + URL)
+                return None
 
         if page.status_code == 303:
-            logging.info("request got redirected: " + URL + " to " + page.url)
+            logger.info("request got redirected: " + URL + " to " + page.url)
             # this means the file is a forced download, so we can't scrape the page
             raise RedirectException(page.headers["Location"])
 
         soup = BeautifulSoup(page.content, self.Parser)
 
         if soup is None:
-            logging.error("No soup could be cooked for" + URL + " !")
+            logger.error("No soup could be cooked for" + URL + " !")
 
         return soup
 
@@ -251,19 +253,19 @@ class SoupChef:
 
             except Exception as e:
                 if retry_count == self.config["MAX_RETRY"] - 1:
-                    logging.error("chromeDriver unable to get: " + URL)
-                    return None
+                    logger.error("chromeDriver unable to get: " + URL)
+                return None
 
         soup = BeautifulSoup(page, self.Parser)
 
         if soup is None:
-            logging.error("No soup could be cooked for" + URL + " !")
+            logger.error("No soup could be cooked for" + URL + " !")
 
         return soup
 
     def shutdown(self):
         if self.driver:
-            logging.info("shutting down webdriver")
+            logger.info("shutting down webdriver")
             self.driver.quit()
 
 
@@ -297,17 +299,17 @@ class Kraken:
                 target = self.to_visit.get(block=True, timeout=15)  # first time takes some while..
                 self.visited.add(target["url"])
                 self.pool.submit(self.scrape, target)
-                #self.scrape(target)
+                # self.scrape(target)
 
             except Empty:
                 self._shutdown()
                 break
             except Exception as e:
                 print(e)
-                logging.error(e)
+                logger.error(e)
                 break
 
-        logging.info("finished scraping")
+        logger.info("finished scraping")
         print("visited: ", len(self.visited))
 
     def scrape(self, target):
@@ -333,19 +335,22 @@ class Kraken:
                     print("hi 404")
                 file_name, file_url = self.parse_filepage(source_URL)
                 if file_name is not None and file_url is not None:
+                    if self.domain != urlparse(file_url).netloc:
+                        logger.debug(f"skipping {file_url} because it is not on the same domain")
+                        return
                     self.save_file({"file_name": file_name, "file_url": file_url, "folder_name": target["block"],
                                     "course_name": target["course"]})
+
         except Exception as e:
-            logging.error(e)
+            logger.error(e)
             print(e)
 
     def _do_login(self):
-
         flag = load_dotenv(config.CREDENTIALS)
         if not flag:
             raise Exception("Credentials file not found")
 
-        logging.info("successfully loaded credentials-file")
+        logger.info("successfully loaded credentials-file")
 
         login_url, token = self._get_form_data(self.config.BASE_URL)  # 'https://elearning.fhws.de/login/index.php'
         login_data = {
@@ -355,9 +360,9 @@ class Kraken:
         }
         response = self.session.post(login_url, data=login_data)
         if response.status_code != 200:
-            logging.error("login failed")
+            logger.error("login failed")
             return
-        logging.info("login successful")
+        logger.info("login successful")
 
     def _get_courses(self):
         index = 0
@@ -365,14 +370,14 @@ class Kraken:
 
         response = self.session.get(self.ajaxCalls[0] + str(index) + self.ajaxCalls[1])
         if response.status_code == 200:
-            logging.info(f"ajax call (nr: {index}) successful - received {len(response.json()['courses'])} courses")
+            logger.info(f"ajax call (nr: {index}) successful - received {len(response.json()['courses'])} courses")
         else:
-            logging.error(f"ajax call (nr: {index}) failed")
+            logger.error(f"ajax call (nr: {index}) failed")
 
         content = response.json()
         requested_courses = content["courses"]
         if len(requested_courses) == 0:
-            logging.error("no courses received during ajax call")
+            logger.error("no courses received during ajax call")
             return
         courses.extend(requested_courses)
         index += 1
@@ -385,20 +390,19 @@ class Kraken:
         while index <= maxIndex:
             response = self.session.get(self.ajaxCalls[0] + str(index) + self.ajaxCalls[1])
             if response.status_code == 200:
-                logging.info(f"ajax call (nr: {index}) successful - received {len(response.json()['courses'])} courses")
-
-                requested_courses = response.json()["courses"]
-                if len(requested_courses) == 0:
-                    logging.error("no courses received during ajax call (nr: {index})")
-                    return
-
-                courses.extend(requested_courses)
-                index += 1
-
+                logger.info(f"ajax call (nr: {index}) successful - received {len(response.json()['courses'])} courses")
             else:
-                logging.error(f"ajax call (nr: {index}) failed")
+                logger.error(f"ajax call (nr: {index}) failed")
 
-        logging.info(f"found {len(courses)} courses")
+            requested_courses = response.json()["courses"]
+            if len(requested_courses) == 0:
+                logger.error("no courses received during ajax call (nr: {index})")
+                return
+
+            courses.extend(requested_courses)
+            index += 1
+
+        logger.info(f"found {len(courses)} courses")
         return courses
 
     def _get_form_data(self, url):
@@ -419,7 +423,6 @@ class Kraken:
         return not bool(re.search("^http", URL))
 
     def parse_coursepage(self, source_URL):
-
         soup = self.soupChef.get_soup_from_URL(source_URL, self.session)
         if soup is None:
             return
@@ -427,7 +430,7 @@ class Kraken:
         # find all blocks on the page
         blocks = soup.select("li.section")
         if blocks is None:
-            logging.error(f"no blocks found on {source_URL}")
+            logger.error(f"no blocks found on {source_URL}")
             return
 
         course_name = soup.select_one("h1").text.strip()
@@ -440,11 +443,11 @@ class Kraken:
             if block_name is None:
                 block_name = block.select_one("h4 div")
                 if block_name is None:
-                    # logging.error(f"no block name found on {source_URL}")
+                    #  logger.error(f"no block name found on {source_URL}")
                     continue
             block_name = block_name.text.strip()
             # for each block, find all links
-            #links = self._filter(block.select("a[href]"))
+            # links = self._filter(block.select("a[href]"))
             links = block.select("a:not([href^='#'])")
             # names = block.select("a[onclick] > span")
             names = []
@@ -459,10 +462,10 @@ class Kraken:
                         else:
                             names.append("404")
                 except Exception as e:
-                    logging.error(f"error while parsing block {block_name} of course {course_name}: {e}")
+                    logger.error(f"error while parsing block {block_name} of course {course_name}: {e}")
 
             if len(links) == 0:
-                logging.warning(f"no links found in block {block_name} of course {course_name}")
+                logger.warning(f"no links found in block {block_name} of course {course_name}")
                 continue
 
             # iterate over all links
@@ -471,32 +474,38 @@ class Kraken:
                     name = names[idx]
                 except IndexError as e:
                     name = "404"
-                    logging.error(
-                        f"no name found for link {elem['href']} in block {block_name} of course {course_name}")
+                    logger.error(f"no name found for link {elem['href']} in block {block_name} of course {course_name}")
                 link = elem["href"]
                 # TODO filter redirects
                 # TODO make constants
                 # TODO beautify
-                if "url" in link or "questionnaire" in link or "forum" in link or "groupselect" in link \
-                        or "assign" in link or "page" in link or "workshop" in link or "data" in link or "user" in link\
-                        or "quiz" in link or "feedback" in link or "choicegroup" in link or "choice" in link\
-                        or "evaluation" in link or "scorm" in link or "lesson" in link or "lightboxgallery" in link\
+                if "questionnaire" in link or "forum" in link or "groupselect" in link \
+                        or "assign" in link or "page" in link or "workshop" in link or "data" in link or "user" in link \
+                        or "quiz" in link or "feedback" in link or "choicegroup" in link or "choice" in link \
+                        or "evaluation" in link or "scorm" in link or "lesson" in link or "lightboxgallery" in link \
                         or "glossary" in link or "chat" in link or "#" in link or "mailto" in link:
                     continue
+
+                if "url" in link:
+                    logger.debug(f"skipping {link} because it is type url")
 
                 if link not in self.visited:
                     self.to_visit.put(
                         {"type": "file", "url": link, "name": name, "block": block_name, "course": course_name})
                     flag = False
 
-            logging.info(f"found {len(links)} links in block {block_name} of course {course_name}")
+            logger.info(f"found {len(links)} links in block {block_name} of course {course_name}")
 
         if flag:
-            logging.warning(f"no new links found in course {course_name}")
+            logger.warning(f"no new links found in course {course_name}")
 
     def parse_filepage(self, source_URL):
         fileName, fileURL = None, None
         try:
+            if self.domain != urlparse(source_URL).netloc:
+                logger.debug(f"skipping {source_URL} because it is not on the same domain")
+                return fileName, fileURL
+
             pathEnding = os.path.splitext(source_URL)[-1]
             if pathEnding != "" and not pathEnding.startswith(".php"):
                 # is file url
@@ -543,15 +552,15 @@ class Kraken:
             return fileName, fileURL
 
         except Exception as e:
-            logging.error(f"failed to parse filepage {source_URL}")
+            logger.error(f"failed to parse filepage {source_URL}")
             return fileName, fileURL
 
-        logging.info(f"found file {fileName} at {fileURL}")
+        logger.info(f"found file {fileName} at {fileURL}")
+
         # TODO filter by filetype
         return fileName, fileURL
 
     def _filter(self, elements):
-
         filteredElements = []
         for element in elements:
             if isinstance(element, dict):
@@ -572,15 +581,15 @@ class Kraken:
             if valid:
                 filteredElements.append(element)
 
-        logging.info(f"filtered {len(elements) - len(filteredElements)} elements")
+        logger.info(f"filtered {len(elements) - len(filteredElements)} elements")
         return filteredElements
 
     def _init_session(self):
         self.session = requests.Session()
         if self.config.URLLIB_POOLSIZE:
-            logging.info(f"setting maxsize of urllib pool to: {self.config.URLLIB_POOLSIZE}")
-            self.session.get_adapter(self.config.BASE_URL).poolmanager.connection_pool_kw[
-                "maxsize"] = self.config.URLLIB_POOLSIZE
+            logger.info(f"setting maxsize of urllib pool to: {self.config.URLLIB_POOLSIZE}")
+        self.session.get_adapter(self.config.BASE_URL).poolmanager.connection_pool_kw[
+            "maxsize"] = self.config.URLLIB_POOLSIZE
 
     def save_file(self, param):
         file_name = param["file_name"].replace(" ", "_")
@@ -593,8 +602,8 @@ class Kraken:
             # first head to get size
             # TODO do that only for certain file types
             file_size = int(self.session.head(file_url).headers["Content-Length"])
-            if (file_size/1000**2) > self.config.MAX_FILE_SIZE_IN_MB:
-                logging.info(f"file {file_name} from {course_name} is too big: {file_size/1000**2} MB")
+            if (file_size / 1000 ** 2) > self.config.MAX_FILE_SIZE_IN_MB:
+                logger.info(f"file {file_name} from {course_name} is too big: {file_size / 1000 ** 2} MB")
                 return
             # get file bytes
             file_bytes = self.session.get(file_url).content
@@ -604,17 +613,17 @@ class Kraken:
             if file_type == "":
                 # TODO set default as a constant
                 file_name += ".zip"
-                #file_type = ".zip"
+                # file_type = ".zip"
             full_path = os.path.join(file_path, file_name)
             os.makedirs(file_path, exist_ok=True)
             with open(full_path, "wb") as f:
                 f.write(file_bytes)
         except Exception as e:
-            logging.error(f"error while saving file {file_name} from {file_url}: {e}")
-        logging.info(f"saved file {file_name} of {course_name}")
+            logger.error(f"error while saving file {file_name} from {file_url}: {e}")
+        logger.info(f"saved file {file_name} of {course_name}")
 
     def _shutdown(self):
-        logging.info("shutting down pool and soupChef")
+        logger.info("shutting down pool and soupChef")
         self.pool.shutdown(wait=True)
         self.soupChef.shutdown()
 
