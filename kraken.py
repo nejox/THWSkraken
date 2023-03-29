@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.ERROR,
                     )
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 def slugify(value, allow_unicode=True):
@@ -99,7 +99,7 @@ class Config:
                 "include_condition": False
             },
             # {
-            #     "condition_string": "Parallel Programming",
+            #     "condition_string": "Parallel Pro",
             #     "include_condition": True
             # }
 
@@ -220,7 +220,7 @@ class SoupChef:
                 return None
 
         if page.status_code == 303:
-            logger.info("request got redirected: " + URL + " to " + page.url)
+            logger.debug("request got redirected: " + URL + " to " + page.url)
             # this means the file is a forced download, so we can't scrape the page
             raise RedirectException(page.headers["Location"])
 
@@ -299,7 +299,7 @@ class Kraken:
                 target = self.to_visit.get(block=True, timeout=15)  # first time takes some while..
                 self.visited.add(target["url"])
                 self.pool.submit(self.scrape, target)
-                # self.scrape(target)
+                #self.scrape(target)
 
             except Empty:
                 self._shutdown()
@@ -310,7 +310,7 @@ class Kraken:
                 break
 
         logger.info("finished scraping")
-        print("visited: ", len(self.visited))
+        logger.info(f"visited: {len(self.visited)}")
 
     def scrape(self, target):
         url = target["url"]
@@ -427,13 +427,25 @@ class Kraken:
         if soup is None:
             return
 
+        course_name = soup.select_one("h1").text.strip()
+
+        # is this a special course with tiles?
+        is_existing = soup.select_one("div#card-container")
+        if is_existing is not None:
+            logger.debug(f"found special course {course_name}")
+            courses = soup.select("li.section a[href*='course']")
+            courses = [course["href"] for course in courses]
+            for course in courses:
+                if course not in self.visited:
+                    self.to_visit.put({"url": course, "type": "course"})
+            return
+
         # find all blocks on the page
         blocks = soup.select("li.section")
         if blocks is None:
             logger.error(f"no blocks found on {source_URL}")
             return
 
-        course_name = soup.select_one("h1").text.strip()
         flag = True
 
         # iterate over all blocks
@@ -445,6 +457,9 @@ class Kraken:
                 if block_name is None:
                     #  logger.error(f"no block name found on {source_URL}")
                     continue
+            if "&section" in source_URL:
+                block_name = block.select_one("h2.section-title")
+
             block_name = block_name.text.strip()
             # for each block, find all links
             # links = self._filter(block.select("a[href]"))
@@ -465,7 +480,7 @@ class Kraken:
                     logger.error(f"error while parsing block {block_name} of course {course_name}: {e}")
 
             if len(links) == 0:
-                logger.warning(f"no links found in block {block_name} of course {course_name}")
+                #logger.warning(f"no links found in block {block_name} of course {course_name} on {source_URL}")
                 continue
 
             # iterate over all links
@@ -486,18 +501,18 @@ class Kraken:
                         or "glossary" in link or "chat" in link or "#" in link or "mailto" in link:
                     continue
 
-                if "url" in link:
-                    logger.debug(f"skipping {link} because it is type url")
+                #if "url" in link:
+                    #logger.debug(f"{link} is type url")
 
                 if link not in self.visited:
                     self.to_visit.put(
                         {"type": "file", "url": link, "name": name, "block": block_name, "course": course_name})
                     flag = False
 
-            logger.info(f"found {len(links)} links in block {block_name} of course {course_name}")
+            logger.debug(f"found {len(links)} links in block {block_name} of course {course_name}")
 
         if flag:
-            logger.warning(f"no new links found in course {course_name}")
+            logger.warning(f"no new links found in course {course_name} {source_URL}")
 
     def parse_filepage(self, source_URL):
         fileName, fileURL = None, None
@@ -531,7 +546,7 @@ class Kraken:
 
             else:
                 # find data link
-                tag = soup.select_one(".resourceworkaround a[onclick]")
+                tag = soup.select_one(".resourceworkaround a[onclick], .urlworkaround a")
                 if tag is None:
                     # TODO beautify
                     # may be a embedded pdf file like in "https://elearning.fhws.de/mod/resource/view.php?id=681498"
@@ -552,10 +567,10 @@ class Kraken:
             return fileName, fileURL
 
         except Exception as e:
-            logger.error(f"failed to parse filepage {source_URL}")
+            logger.error(f"failed to parse filepage {source_URL}: {e}")
             return fileName, fileURL
 
-        logger.info(f"found file {fileName} at {fileURL}")
+        logger.debug(f"found file {fileName} at {fileURL}")
 
         # TODO filter by filetype
         return fileName, fileURL
@@ -601,12 +616,17 @@ class Kraken:
         try:
             # first head to get size
             # TODO do that only for certain file types
-            file_size = int(self.session.head(file_url).headers["Content-Length"])
+            try:
+                file_size = int(self.session.head(file_url).headers["Content-Length"])
+            except Exception as e:
+                logger.error(f"failed to get file size of {file_name} from {course_name}: {e}")
+                file_size = 1
             if (file_size / 1000 ** 2) > self.config.MAX_FILE_SIZE_IN_MB:
                 logger.info(f"file {file_name} from {course_name} is too big: {file_size / 1000 ** 2} MB")
                 return
             # get file bytes
-            file_bytes = self.session.get(file_url).content
+            file = self.session.get(file_url)
+            file_bytes = file.content
 
             file_path = os.path.join(self.config.DOWNLOAD_PATH, course_name, block_name)
             file_type = os.path.splitext(file_name)[-1]
@@ -620,7 +640,7 @@ class Kraken:
                 f.write(file_bytes)
         except Exception as e:
             logger.error(f"error while saving file {file_name} from {file_url}: {e}")
-        logger.info(f"saved file {file_name} of {course_name}")
+        logger.debug(f"saved file {file_name} of {course_name}")
 
     def _shutdown(self):
         logger.info("shutting down pool and soupChef")
